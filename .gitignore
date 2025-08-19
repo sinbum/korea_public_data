@@ -1,1 +1,9 @@
 .mcp.json
+<<<<<<< HEAD
+=======
+volumes/
+
+.env.local
+.env.performance
+.env.production
+>>>>>>> f66a857 (chore: Update .gitignore to include environment files)
