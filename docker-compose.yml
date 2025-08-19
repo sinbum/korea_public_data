@@ -1,0 +1,235 @@
+services:
+  # MongoDB Database
+  mongodb:
+    image: mongo:6.0
+    container_name: korea_mongodb_prod
+    restart: unless-stopped
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME:-admin}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD:-admin_password}
+      - MONGO_INITDB_DATABASE=${MONGO_INITDB_DATABASE:-korea_public_api}
+    ports:
+      - "27017:27017"
+    volumes:
+      - ./be/volumes/mongodb/data:/data/db
+      - ./be/volumes/mongodb/configdb:/data/configdb
+      - ./be/scripts/init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    networks:
+      - korea_network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh mongodb://localhost:27017/test --quiet
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: korea_redis_prod
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./be/volumes/redis/data:/data
+    networks:
+      - korea_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Backend API Server (Production)
+  backend:
+    build:
+      context: ./be
+      dockerfile: Dockerfile
+      target: production
+    container_name: korea_backend_prod
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - MONGODB_URL=mongodb://api_user:api_password@mongodb:27017/korea_public_api
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_NAME=${DATABASE_NAME:-korea_public_api}
+      - DEBUG=False
+      - LOG_LEVEL=INFO
+      - NODE_ENV=production
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+    volumes:
+      - ./be/volumes/logs:/app/logs
+      - ./be/volumes/uploads:/app/uploads
+      - ./be/volumes/tmp:/app/tmp
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - korea_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Frontend Next.js Application (Production)
+  frontend:
+    build:
+      context: ./fe
+      dockerfile: Dockerfile
+      target: runner
+    container_name: korea_frontend_prod
+    restart: unless-stopped
+    ports:
+      - "3002:3000"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_BASE_URL=http://localhost:80
+      - NEXT_PUBLIC_API_PROXY=0
+      - NEXT_PUBLIC_AUTH_MODE=cookie
+      - NEXTAUTH_URL=http://localhost:3002
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-production_test_jwt_secret_key_minimum_32_chars_long_for_testing_only}
+      - API_BASE_URL_INTERNAL=http://backend:8000
+    depends_on:
+      - backend
+    networks:
+      - korea_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Celery Worker (Production)
+  celery_worker:
+    build:
+      context: ./be
+      dockerfile: Dockerfile
+      target: production
+    container_name: korea_celery_worker_prod
+    restart: unless-stopped
+    command: celery -A app.core.celery worker --loglevel=info --concurrency=4
+    env_file:
+      - .env
+    environment:
+      - MONGODB_URL=mongodb://api_user:api_password@mongodb:27017/korea_public_api
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_NAME=${DATABASE_NAME:-korea_public_api}
+      - DEBUG=False
+      - LOG_LEVEL=INFO
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+    volumes:
+      - ./be/volumes/logs:/app/logs
+      - ./be/volumes/tmp:/app/tmp
+    depends_on:
+      - mongodb
+      - redis
+    networks:
+      - korea_network
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.core.celery", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Celery Beat Scheduler (Production)
+  celery_beat:
+    build:
+      context: ./be
+      dockerfile: Dockerfile
+      target: production
+    container_name: korea_celery_beat_prod
+    restart: unless-stopped
+    command: celery -A app.core.celery beat --loglevel=info
+    env_file:
+      - .env
+    environment:
+      - MONGODB_URL=mongodb://api_user:api_password@mongodb:27017/korea_public_api
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_NAME=${DATABASE_NAME:-korea_public_api}
+      - DEBUG=False
+      - LOG_LEVEL=INFO
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+    volumes:
+      - ./be/volumes/logs:/app/logs
+      - ./be/volumes/tmp:/app/tmp
+    depends_on:
+      - mongodb
+      - redis
+    networks:
+      - korea_network
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: korea_nginx_prod
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./be/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./be/volumes/logs/nginx:/var/log/nginx
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - korea_network
+
+  # Monitoring with Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: korea_prometheus_prod
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./be/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./be/volumes/prometheus:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - korea_network
+
+  # Grafana for Monitoring Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: korea_grafana_prod
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-test_grafana_password}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./be/volumes/grafana:/var/lib/grafana
+      - ./be/monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./be/monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+    depends_on:
+      - prometheus
+    networks:
+      - korea_network
+
+networks:
+  korea_network:
+    driver: bridge
+    name: korea_network
+
+volumes:
+  mongodb_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
